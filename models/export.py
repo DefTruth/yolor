@@ -41,11 +41,16 @@ if __name__ == '__main__':
     parser.add_argument('--weights', type=str, default='./yolor-p6.pt', help='weights path')
     parser.add_argument('--img-size', nargs='+', type=int, default=[1280, 1280], help='image size')  # height, width
     parser.add_argument('--batch-size', type=int, default=1, help='batch size')
+    parser.add_argument('--inplace', action='store_true', help='set inplace of Yolo Detect layer to True')
+    parser.add_argument('--simplify', action='store_true', help='use onnx-simplifier')
     opt = parser.parse_args()
     opt.img_size *= 2 if len(opt.img_size) == 1 else 1  # expand
     print(opt)
     set_logging()
     t = time.time()
+
+    detect_inplace = opt.inplace or False
+    do_simplify = opt.simplify or True
 
     # Load PyTorch model
     model = attempt_load(opt.weights, map_location=torch.device('cpu'))  # load FP32 model
@@ -55,7 +60,7 @@ if __name__ == '__main__':
 
     model = convert_sync_batchnorm_to_batchnorm(model)
 
-    print(model)
+    #print(model)
 
     # Checks
     gs = int(max(model.stride))  # grid size (max stride)
@@ -69,12 +74,15 @@ if __name__ == '__main__':
         m._non_persistent_buffers_set = set()  # pytorch 1.6.0 compatibility
         if isinstance(m, models.common.Conv) and isinstance(m.act, nn.Hardswish):
             m.act = Hardswish()  # assign activation
-        # if isinstance(m, models.yolo.Detect):
-        #     m.forward = m.forward_export  # assign forward (optional)
+        #if isinstance(m, models.yolo.IDetect):
+        #    m.inplace = detect_inplace
+        #    m.forward = m.forward_export  # assign forward (optional)
     model.model[-1].export = True  # set Detect() layer export=True
+    model.model[-1].inplace = detect_inplace  # set Detect() layer inplace=True
+    train = False
     y = model(img)  # dry run
 
-    print(y[0].shape)
+    print("out[0].shape: {}".format(y[0].shape))
 
     # TorchScript export
     try:
@@ -93,29 +101,39 @@ if __name__ == '__main__':
 
         print('\nStarting ONNX export with onnx %s...' % onnx.__version__)
         f = opt.weights.replace('.pt', f'-{opt.img_size[0]}-{opt.img_size[1]}.onnx')  # filename
-        torch.onnx.export(model, img, f, verbose=False, opset_version=12, input_names=['images'],
+        torch.onnx.export(model, img, f, verbose=False,
+                          opset_version=12,
+                          do_constant_folding=not train,
+                          training=torch.onnx.TrainingMode.TRAINING if train else torch.onnx.TrainingMode.EVAL,
+                          input_names=['images'],
                           output_names=['classes', 'boxes'] if y is None else ['output'])
 
-        # Checks
+        # Load
         onnx_model = onnx.load(f)  # load onnx model
-        onnx.checker.check_model(onnx_model)  # check onnx model
-        print(onnx.helper.printable_graph(onnx_model.graph))  # print a human readable model
 
-        do_simplify = True
+        #do_simplify = True
         if do_simplify:
+            print('Simplifying...')
             from onnxsim import simplify
 
             onnx_model, check = simplify(onnx_model, check_n=3)
             assert check, 'assert simplify check failed'
             onnx.save(onnx_model, f)
+            print('Simplify success.')
 
-        session = ort.InferenceSession(f)
+        print(onnx.helper.printable_graph(onnx_model.graph))  # print a human readable model
+        print("Model successfully saved and loaded")
 
-        for ii in session.get_inputs():
-            print("input: ", ii)
+        # Check
+        onnx.checker.check_model(onnx_model)  # check onnx model
 
-        for oo in session.get_outputs():
-            print("output: ", oo)
+        #session = ort.InferenceSession(f)
+
+        #for ii in session.get_inputs():
+        #    print("input: ", ii)
+
+        #for oo in session.get_outputs():
+        #    print("output: ", oo)
 
         print('ONNX export success, saved as %s' % f)
     except Exception as e:
@@ -138,7 +156,7 @@ if __name__ == '__main__':
     print('\nExport complete (%.2fs). Visualize with https://github.com/lutzroeder/netron.' % (time.time() - t))
 
     """
-    PYTHONPATH=. python3 ./models/export.py --weights ./weights/yolor-p6.pt --img-size 640 
-    PYTHONPATH=. python3 ./models/export.py --weights ./weights/yolor-p6.pt --img-size 320 
-    PYTHONPATH=. python3 ./models/export.py --weights ./weights/yolor-p6.pt --img-size 1280 
+    PYTHONPATH=. python3 ./models/export.py --weights ./weights/yolor-p6.pt --img-size 640
+    PYTHONPATH=. python3 ./models/export.py --weights ./weights/yolor-p6.pt --img-size 320
+    PYTHONPATH=. python3 ./models/export.py --weights ./weights/yolor-p6.pt --img-size 1280
     """
